@@ -1,0 +1,17 @@
+{
+  "name": "order-service",
+  "version": "1.0.0",
+  "private": true,
+  "description": "SmartCart orders: PostgreSQL + outbox + Kafka (saga)",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node --test"
+  },
+  "engines": { "node": ">=20" },
+  "dependencies": {
+    "express": "^4.19.2",
+    "kafkajs": "^2.2.4",
+    "pg": "^8.12.0"
+  }
+}

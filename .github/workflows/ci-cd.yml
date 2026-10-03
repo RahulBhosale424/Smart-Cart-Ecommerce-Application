@@ -1,0 +1,113 @@
+# CI/CD pipeline for SmartCart
+#
+#   every push and pull request :  1) run the tests of all 7 services
+#                                  2) build all Docker images
+#   push to main only           :  3) deploy to the AWS EC2 server
+#
+# Setup steps (secrets, server) are in docs/DEPLOY-AWS.md
+
+name: CI-CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # ---------- 1. tests (one job per service, run in parallel) ----------
+  test:
+    name: Test ${{ matrix.service }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service:
+          - api-gateway
+          - auth-service
+          - product-service
+          - cart-service
+          - order-service
+          - payment-service
+          - notification-service
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: ${{ matrix.service }}/package-lock.json
+      - name: Install dependencies
+        run: npm ci
+        working-directory: ${{ matrix.service }}
+      - name: Run tests
+        run: npm test
+        working-directory: ${{ matrix.service }}
+
+  # ---------- 2. build every Docker image ----------
+  docker-build:
+    name: Build Docker images
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create a .env for the build
+        run: cp .env.example .env
+      - name: Build all images
+        run: docker compose build
+
+  # ---------- 3. deploy to AWS (only after a push to main) ----------
+  deploy:
+    name: Deploy to AWS EC2
+    needs: docker-build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    env:
+      EC2_HOST: ${{ secrets.EC2_HOST }}
+      EC2_USER: ${{ secrets.EC2_USER }}
+      EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check that the deployment secrets exist
+        run: |
+          for name in EC2_HOST EC2_USER EC2_SSH_KEY; do
+            if [ -z "${!name}" ]; then
+              echo "::error::GitHub secret $name is missing. Follow docs/DEPLOY-AWS.md, step 5."
+              exit 1
+            fi
+          done
+
+      - name: Prepare SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "$EC2_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "$EC2_HOST" >> ~/.ssh/known_hosts
+
+      # Copies the code to the server. The server's private ".env" is NOT touched.
+      - name: Copy the project to the server
+        run: |
+          rsync -az --delete \
+            --exclude '.git' --exclude 'node_modules' --exclude '.next' --exclude '.env' \
+            -e "ssh -i ~/.ssh/deploy_key" \
+            ./ "$EC2_USER@$EC2_HOST:~/smartcart/"
+
+      - name: Build and restart the containers on the server
+        run: |
+          ssh -i ~/.ssh/deploy_key "$EC2_USER@$EC2_HOST" \
+            'cd ~/smartcart && docker compose up -d --build --remove-orphans && docker image prune -f'
+
+      # Calls the live site (frontend -> gateway -> product service). Retries for up to 5 minutes.
+      - name: Smoke test the live site
+        run: |
+          for i in $(seq 1 30); do
+            if curl -fsS "http://$EC2_HOST/api/products?limit=1" > /dev/null; then
+              echo "Site is up and answering API calls."
+              exit 0
+            fi
+            echo "Not ready yet ($i/30)..."
+            sleep 10
+          done
+          echo "::error::The site did not become healthy in time."
+          exit 1

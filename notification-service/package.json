@@ -1,0 +1,16 @@
+{
+  "name": "notification-service",
+  "version": "1.0.0",
+  "private": true,
+  "description": "SmartCart notifications: sends emails when orders are confirmed or cancelled",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node --test"
+  },
+  "engines": { "node": ">=20" },
+  "dependencies": {
+    "kafkajs": "^2.2.4",
+    "nodemailer": "^6.9.14"
+  }
+}

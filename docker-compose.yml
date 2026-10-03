@@ -1,0 +1,250 @@
+# SmartCart: the whole system with ONE command:   docker compose up --build -d
+#
+#   Browser -> frontend (Next.js) -> api-gateway -> auth / product / cart / order
+#                                                      |
+#                       Kafka events:  order -> payment -> order -> notification
+#
+# Settings come from the ".env" file next to this file (copy .env.example).
+
+name: smartcart
+
+x-service: &service
+  restart: unless-stopped
+  init: true # cleans up processes and lets "docker stop" finish quickly
+
+services:
+  # ===================== data stores =====================
+  postgres:
+    <<: *service
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Please create the .env file first (copy .env.example)}
+      POSTGRES_DB: smartcart_auth
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d smartcart_auth"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  mongo:
+    <<: *service
+    image: mongo:7
+    command: ["mongod", "--wiredTigerCacheSizeGB", "0.25"] # keeps memory low on small servers
+    volumes:
+      - mongodata:/data/db
+    healthcheck:
+      test: ["CMD-SHELL", "mongosh --quiet --eval 'db.runCommand({ping:1}).ok' | grep -q 1"]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+
+  redis:
+    <<: *service
+    image: redis:7-alpine
+    # volatile-lru: when memory is full, only keys that have an expiry (cache, carts) can be removed.
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "128mb", "--maxmemory-policy", "volatile-lru"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  kafka:
+    <<: *service
+    image: apache/kafka:3.7.0 # single node, KRaft mode (no Zookeeper needed)
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_HEAP_OPTS: "-Xms256m -Xmx512m"
+    volumes:
+      - kafkadata:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 15s
+      retries: 20
+      start_period: 30s
+
+  # ===================== microservices =====================
+  api-gateway:
+    <<: *service
+    build: ./api-gateway
+    environment:
+      SERVICE_NAME: api-gateway
+      PORT: 3000
+      JWT_SECRET: ${JWT_SECRET:?Please set JWT_SECRET in .env}
+      REDIS_URL: redis://redis:6379
+      RATE_LIMIT_PER_MIN: ${RATE_LIMIT_PER_MIN:-300}
+      AUTH_SERVICE_URL: http://auth-service:3001
+      PRODUCT_SERVICE_URL: http://product-service:3002
+      CART_SERVICE_URL: http://cart-service:3003
+      ORDER_SERVICE_URL: http://order-service:3004
+    ports:
+      - "${GATEWAY_PORT:-8080}:3000"
+    depends_on:
+      redis: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/health > /dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  auth-service:
+    <<: *service
+    build: ./auth-service
+    environment:
+      SERVICE_NAME: auth-service
+      PORT: 3001
+      JWT_SECRET: ${JWT_SECRET}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@smartcart.dev}
+      PGHOST: postgres
+      PGUSER: ${POSTGRES_USER:-postgres}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      PGDATABASE: smartcart_auth
+    depends_on:
+      postgres: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3001/health > /dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  product-service:
+    <<: *service
+    build: ./product-service
+    environment:
+      SERVICE_NAME: product-service
+      PORT: 3002
+      MONGO_URL: mongodb://mongo:27017/smartcart_products
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKERS: kafka:9092
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_EMBEDDING_MODEL: ${OPENAI_EMBEDDING_MODEL:-text-embedding-3-small}
+      MIN_SIMILARITY: ${MIN_SIMILARITY:-0.25}
+    depends_on:
+      mongo: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      kafka: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3002/health > /dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+
+  cart-service:
+    <<: *service
+    build: ./cart-service
+    environment:
+      SERVICE_NAME: cart-service
+      PORT: 3003
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      redis: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3003/health > /dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  order-service:
+    <<: *service
+    build: ./order-service
+    environment:
+      SERVICE_NAME: order-service
+      PORT: 3004
+      PGHOST: postgres
+      PGUSER: ${POSTGRES_USER:-postgres}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      PGDATABASE: smartcart_orders
+      KAFKA_BROKERS: kafka:9092
+      CART_SERVICE_URL: http://cart-service:3003
+      PRODUCT_SERVICE_URL: http://product-service:3002
+      CURRENCY: ${CURRENCY:-inr}
+    depends_on:
+      postgres: { condition: service_healthy }
+      kafka: { condition: service_healthy }
+      cart-service: { condition: service_healthy }
+      product-service: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3004/health > /dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+
+  payment-service:
+    <<: *service
+    build: ./payment-service
+    environment:
+      SERVICE_NAME: payment-service
+      PORT: 3005
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKERS: kafka:9092
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
+    ports:
+      - "127.0.0.1:3005:3005" # only on this machine: lets you check the circuit breaker state
+    depends_on:
+      redis: { condition: service_healthy }
+      kafka: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3005/health > /dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+
+  notification-service:
+    <<: *service
+    build: ./notification-service
+    environment:
+      SERVICE_NAME: notification-service
+      PORT: 3006
+      KAFKA_BROKERS: kafka:9092
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      EMAIL_FROM: ${EMAIL_FROM:-SmartCart <no-reply@smartcart.dev>}
+    depends_on:
+      kafka: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3006/health > /dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+
+  # ===================== website =====================
+  frontend:
+    <<: *service
+    build:
+      context: ./frontend
+      args:
+        GATEWAY_URL: http://api-gateway:3000
+    ports:
+      - "${FRONTEND_PORT:-3100}:3000"
+    depends_on:
+      api-gateway: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/ > /dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  pgdata:
+  mongodata:
+  redisdata:
+  kafkadata:
